@@ -1,6 +1,7 @@
 # import the necessary packages
 from edgetpu.detection.engine import DetectionEngine
 from imutils.video import VideoStream
+from imutils import build_montages
 from PIL import Image
 import argparse
 import imutils
@@ -11,6 +12,7 @@ from flask import Flask
 from flask import render_template
 import threading
 import datetime
+import imagezmq
 
 # initialize the output frame and a lock used to ensure thread-safe exchanges of the output frames (useful when multiple browsers/tabs are viewing the stream)
 outputFrame = None
@@ -19,8 +21,8 @@ lock = threading.Lock()
 # initialize a flask object
 app = Flask(__name__)
 
-# initialize the video stream and allow the camera sensor to warmup
-vs = VideoStream(src="http://pumpkinpi.local:8000/video_feed").start()
+# initialize the ImageHub object
+image_hub = imagezmq.ImageHub()
 
 @app.route("/")
 def index():
@@ -30,22 +32,48 @@ def index():
 def detect_objects(model, labels):
     # grab global references to the video stream, output frame, and
     # lock variables
-    global vs, outputFrame, lock
+    global image_hub, outputFrame, lock
+
+    frameDict = {}
+
+    # initialize the dictionary which will contain  information regarding when a device was last active, then store the last time the check was made was now
+    lastActive = {}
+    lastActiveCheck = datetime.datetime.now()
+
+    # stores the estimated number of Pis, active checking period, and calculates the duration seconds to wait before making a check to see if a device was active
+    ESTIMATED_NUM_PIS = 4
+    ACTIVE_CHECK_PERIOD = 10
+    ACTIVE_CHECK_SECONDS = ESTIMATED_NUM_PIS * ACTIVE_CHECK_PERIOD
+
+    # assign montage width and height so we can view all incoming frames in a single "dashboard"
+    mW = 2
+    mH = 1
+    #print("[INFO] detecting: {}...".format(", ".join(obj for obj in labels)))
 
     # loop over frames from the video stream
     while True:
-        # grab the frame from the threaded video stream and resize it to have a maximum width of 500 pixels
-        frame = vs.read()
-        frame = imutils.resize(frame, width=500)
-        orig = frame.copy()
+        # receive RPi name and frame from the RPi and acknowledge the receipt
+        (rpiName, frame) = image_hub.recv_image()
+        image_hub.send_reply(b'OK')
+        print("[INFO] recv image from " + rpiName)
+
+        frame = imutils.resize(frame, width=400)
+        (h, w) = frame.shape[:2]
+
+        # if a device is not in the last active dictionary then it means that its a newly connected device
+        if rpiName not in lastActive.keys():
+            print("[INFO] receiving data from {}...".format(rpiName))
+
+        # record the last active time for the device from which we just received a frame
+        lastActive[rpiName] = datetime.datetime.now()
 
         # prepare the frame for object detection by converting (1) it from BGR to RGB channel ordering and then (2) from a NumPy array to PIL image format
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame = Image.fromarray(frame)
+        img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(frame)
 
         # make predictions on the input frame
         start = time.time()
-        results = model.DetectWithImage(frame, threshold=args["confidence"], keep_aspect_ratio=True, relative_coord=False)
+        results = model.detect_with_image(img, threshold=args["confidence"], keep_aspect_ratio=True, relative_coord=False)
         end = time.time()
 
         # loop over the results
@@ -56,19 +84,40 @@ def detect_objects(model, labels):
             label = labels[r.label_id]
 
             # draw the bounding box and label on the image
-            cv2.rectangle(orig, (startX, startY), (endX, endY), (0, 255, 0), 2)
+            cv2.rectangle(frame, (startX, startY), (endX, endY), (0, 255, 0), 2)
             y = startY - 15 if startY - 15 > 15 else startY + 15
             text = "{}: {:.2f}%".format(label, r.score * 100)
-            cv2.putText(orig, text, (startX, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            cv2.putText(frame, text, (startX, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
+        frameDict[rpiName] = frame
 
-        # grab the current timestamp and draw it on the frame
-        timestamp = datetime.datetime.now()
-        cv2.putText(orig, timestamp.strftime("%A %d %B %Y %I:%M:%S%p"), (10, frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1)
+        # build a montage using images in the frame dictionary
+        montages = build_montages(frameDict.values(), (w, h), (mW, mH))
 
         # acquire the lock, set the output frame, and release the lock
         with lock:
-             outputFrame = orig.copy()
+
+            if len(montages) > 0:
+                first_montage = montages[0].copy()
+
+                # grab the current timestamp and draw it on the frame
+                timestamp = datetime.datetime.now()
+                cv2.putText(first_montage, timestamp.strftime("%A %d %B %Y %I:%M:%S%p"), (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1)
+                outputFrame = first_montage
+
+        print("[INFO] done recv image from " + rpiName)
+
+        # if current time *minus* last time when the active device check was made is greater than the threshold set then do a check
+        if (datetime.datetime.now() - lastActiveCheck).seconds > ACTIVE_CHECK_SECONDS:
+            # loop over all previously active devices
+            for (rpiName, ts) in list(lastActive.items()):
+                # remove the RPi from the last active and frame dictionaries if the device hasn't been active recently
+                if (datetime.datetime.now() - ts).seconds > ACTIVE_CHECK_SECONDS:
+                    print("[INFO] lost connection to {}".format(rpiName))
+                    lastActive.pop(rpiName)
+                    frameDict.pop(rpiName)
+            # set the last active check time as current time
+            lastActiveCheck = datetime.datetime.now()
 
 def generate():
     # grab global references to the output frame and lock variables
@@ -78,6 +127,7 @@ def generate():
     while True:
         # wait until the lock is acquired
         with lock:
+            print("[INFO] generating video feed")
             # check if the output frame is available, otherwise skip the iteration of the loop
             if outputFrame is None:
                 continue
@@ -86,11 +136,13 @@ def generate():
             (flag, encodedImage) = cv2.imencode(".jpg", outputFrame)
 
             # ensure the frame was successfully encoded
-            if not flag:
-                continue
+        if not flag:
+            continue
 
-            # yield the output frame in the byte format
-            yield(b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + bytearray(encodedImage) + b'\r\n')
+        # yield the output frame in the byte format
+        yield(b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + bytearray(encodedImage) + b'\r\n')
+
+        print("[INFO] done generating video feed")
 
 @app.route("/video_feed")
 def video_feed():
@@ -127,7 +179,4 @@ if __name__ == '__main__':
 
     # start the flask app
     app.run(host="0.0.0.0", port=args["port"], debug=True, threaded=True, use_reloader=False)
-
-# release the video stream pointer
-vs.stop()
 
